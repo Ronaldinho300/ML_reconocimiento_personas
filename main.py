@@ -1,9 +1,10 @@
 """
 main.py
-Orquestador principal - VERSION MULTI-PERSONA.
-- YOLOv8: Detecta cuantas personas hay
-- MoveNet: Pose estimation por persona
-- Clasificador: Alertas individuales por persona sospechosa
+Orquestador principal - VERSION COMPLETAMENTE AUTOMATICA.
+- No requiere pulsar teclas para clasificar ni capturar
+- Clasificacion activa siempre
+- Guardado automatico de sospechosos con cooldown por persona
+- Presiona 'q' para salir (unica tecla necesaria)
 """
 
 import sys
@@ -32,11 +33,12 @@ except ImportError as e:
 
 
 def sonido_alerta():
-    sistema = platform.system()
+    """Emite un beep de alerta."""
     try:
-        if sistema == "Windows":
+        if platform.system() == "Windows":
             import winsound
-            winsound.Beep(1000, 500)
+            winsound.Beep(1000, 600)
+            winsound.Beep(1200, 400)
         else:
             print("\a", end="", flush=True)
     except Exception:
@@ -44,10 +46,17 @@ def sonido_alerta():
 
 
 class SistemaVigilancia:
-    def __init__(self):
+    def __init__(self, guardar_sospechosos=True, cooldown_captura_seg=5):
+        """
+        :param guardar_sospechosos: Si True, guarda capturas automaticamente
+        :param cooldown_captura_seg: Segundos entre capturas del mismo sospechoso
+        """
+        self.guardar_sospechosos = guardar_sospechosos
+        self.cooldown_captura = cooldown_captura_seg
+
         print("=" * 60)
-        print("  SISTEMA DE VIGILANCIA INTELIGENTE - MULTI-PERSONA")
-        print("  (YOLOv8 + MoveNet + Clasificacion geometrica)")
+        print("  SISTEMA DE VIGILANCIA INTELIGENTE - AUTOMATICO")
+        print("  (YOLOv8 + MoveNet + Clasificacion en tiempo real)")
         print("=" * 60)
 
         print()
@@ -61,90 +70,142 @@ class SistemaVigilancia:
         print("      ✓ Detector listo.")
 
         print("[3/4] Preparando capturador...")
-        self.capturador = Capturador(carpeta_salida="dataset_capturado")
+        self.capturador = Capturador(carpeta_salida="alertas_sospechosos")
         print("      ✓ Capturador listo.")
 
         print("[4/4] Iniciando clasificador...")
         self.clasificador = ClasificadorComportamiento(
-            umbral_quieta=150.0,
-            umbral_sospechoso=800.0,
-            historial_frames=15
+            umbral_quieta=100.0,
+            umbral_sospechoso=600.0,
+            umbral_acercamiento=1.25,
+            umbral_desplazamiento=300.0,
+            historial_frames=10
         )
         print("      ✓ Clasificador listo.")
 
-        self.modo_captura = False
-        self.modo_clasificacion = False
+        # Estado del sistema
         self.tracker_presencia = {}
         self.contador_frames = 0
         self.ultimo_log = 0
         self.ultimo_sonido = 0
+        self.sospechoso_activo = False
+
+        # Cooldown de captura por persona (id -> timestamp ultima captura)
+        self.ultima_captura_sospechoso = {}
 
         print()
         print("=" * 60)
-        print("  TODOS LOS MODULOS CARGADOS")
+        print("  SISTEMA LISTO - Presiona 'q' para salir")
         print("=" * 60)
 
-    def mostrar_menu(self, frame, total_personas, num_sospechosos):
+    def mostrar_hud(self, frame, total_personas, num_sospechosos, clasificaciones):
+        """Dibuja el panel de informacion en pantalla."""
         overlay = frame.copy()
-        cv2.rectangle(overlay, (5, 5), (420, 180), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (5, 5), (480, 200), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
-        alerta_texto = ""
+        # Color segun estado
+        color_estado = (0, 255, 0)  # verde = todo normal
+        estado_texto = "NORMAL"
         if num_sospechosos > 0:
-            alerta_texto = " | ⚠ SOSPECHOSOS: " + str(num_sospechosos)
+            color_estado = (0, 0, 255)  # rojo = alerta
+            estado_texto = "ALERTA!"
+        elif total_personas > 0:
+            color_estado = (0, 255, 255)  # amarillo = personas detectadas
+            estado_texto = "VIGILANDO"
 
         lineas = [
-            "Personas detectadas: " + str(total_personas) + alerta_texto,
-            "Modo captura: " + ("ON" if self.modo_captura else "OFF") + " (ESPACIO)",
-            "Modo clasif: " + ("ON" if self.modo_clasificacion else "OFF") + " (C)",
-            "Detector: YOLOv8 + MoveNet",
-            "[Q] Salir | [G] Guardar frame | [L] Log",
+            "ESTADO: " + estado_texto,
+            "Personas: " + str(total_personas) + " | Sospechosos: " + str(num_sospechosos),
+            "Modo: AUTOMATICO (sin intervencion)",
+            "[q] Salir del sistema",
         ]
 
         for i, texto in enumerate(lineas):
-            color = (0, 255, 255) if i == 0 else (200, 200, 200)
-            if num_sospechosos > 0 and i == 0:
+            color = color_estado if i == 0 else (200, 200, 200)
+            if i == 1 and num_sospechosos > 0:
                 color = (0, 0, 255)
-            cv2.putText(frame, texto, (15, 30 + i * 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 1)
+            cv2.putText(frame, texto, (15, 35 + i * 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2)
+
+        # Mostrar info de cada persona
+        y_offset = 140
+        for c in clasificaciones:
+            info = "P" + str(c["id"]) + ": " + c["nombre"]
+            if c["nombre"] == "Sospechoso":
+                color_info = (0, 0, 255)
+                info += " (!)"
+            elif c["nombre"] == "Movimiento":
+                color_info = (0, 255, 255)
+            else:
+                color_info = (0, 255, 0)
+
+            cv2.putText(frame, info, (15, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, color_info, 1)
+            y_offset += 22
 
         return frame
 
     def verificar_alertas(self, frame, boxes, total_personas, clasificaciones):
+        """Verifica alertas y guarda capturas automaticas."""
         alertas = []
         color_borde = (0, 255, 0)
         ahora = time.time()
         num_sospechosos = 0
+        hay_sospechoso_ahora = False
 
         # Alerta 1: Multiples personas
         if total_personas > 3:
             alertas.append("ALERTA: Multiples personas (" + str(total_personas) + ")!")
             color_borde = (0, 0, 255)
 
-        # Alerta 2: Personas sospechosas individuales
+        # Alerta 2: Personas sospechosas
         if clasificaciones:
             for c in clasificaciones:
-                if c["nombre"] == "Sospechoso" and c["confianza"] > 0.6:
+                if c["nombre"] == "Sospechoso" and c["confianza"] > 0.5:
                     num_sospechosos += 1
-                    alertas.append("ALERTA: Persona " + str(c["id"]) + " SOSPECHOSA!")
-                    color_borde = (0, 0, 255)
+                    hay_sospechoso_ahora = True
+                    pid = c["id"]
+
+                    # Dibujar alerta visual
                     x, y, w, h = c["box"]
-                    cv2.putText(frame, "!!! SOSPECHOSO !!!", (x, y - 45),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 3)
-                    if ahora - self.ultimo_sonido > 3:
-                        sonido_alerta()
-                        self.ultimo_sonido = ahora
-                    self.log_evento("Persona " + str(c["id"]) + " - Movimiento sospechoso")
+                    cv2.line(frame, (x, y), (x + w, y + h), (0, 0, 255), 4)
+                    cv2.line(frame, (x + w, y), (x, y + h), (0, 0, 255), 4)
+
+                    # Guardar captura automatica con cooldown
+                    if self.guardar_sospechosos:
+                        ultima = self.ultima_captura_sospechoso.get(pid, 0)
+                        if ahora - ultima > self.cooldown_captura:
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            nombre = "SOSPECHOSO_P" + str(pid) + "_" + ts + ".jpg"
+                            cv2.imwrite(nombre, frame)
+                            self.ultima_captura_sospechoso[pid] = ahora
+                            self.log_evento("CAPTURA AUTO: Persona " + str(pid) + " -> " + nombre)
+                            print("[ALERTA] Captura guardada: " + nombre)
+
+                    # Log
+                    self.log_evento("SOSPECHOSO P" + str(pid) + " | munecas=" + 
+                                    str(int(c["velocidad_munecas"])) + " despl=" + 
+                                    str(int(c["velocidad_desplazamiento"])))
+
+        # Sonido de alerta (solo cuando aparece nuevo sospechoso)
+        if hay_sospechoso_ahora and not self.sospechoso_activo:
+            if ahora - self.ultimo_sonido > 2:
+                sonido_alerta()
+                self.ultimo_sonido = ahora
+            self.sospechoso_activo = True
+        elif not hay_sospechoso_ahora:
+            self.sospechoso_activo = False
 
         # Alerta 3: Presencia prolongada
         ids_activos = set()
         for i, (x, y, w, h) in enumerate(boxes):
-            pid = "p_" + str(x) + "_" + str(y)
-            ids_activos.add(pid)
-            if pid not in self.tracker_presencia:
-                self.tracker_presencia[pid] = ahora
+            pid_str = "p_" + str(x) + "_" + str(y)
+            ids_activos.add(pid_str)
+            if pid_str not in self.tracker_presencia:
+                self.tracker_presencia[pid_str] = ahora
             else:
-                duracion = ahora - self.tracker_presencia[pid]
+                duracion = ahora - self.tracker_presencia[pid_str]
                 if duracion > 10:
                     alertas.append("ALERTA: Presencia prolongada (" + str(int(duracion)) + "s)")
                     color_borde = (0, 165, 255)
@@ -153,6 +214,7 @@ class SistemaVigilancia:
 
         self.tracker_presencia = {k: v for k, v in self.tracker_presencia.items() if k in ids_activos}
 
+        # Dibujar alertas en pantalla
         if alertas:
             for i, alerta in enumerate(alertas[-3:]):
                 cv2.putText(frame, alerta, (15, 460 - i * 25),
@@ -162,86 +224,78 @@ class SistemaVigilancia:
         return frame, num_sospechosos
 
     def log_evento(self, mensaje):
+        """Registra eventos en archivo de log."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open("log_vigilancia.txt", "a", encoding="utf-8") as f:
             f.write("[" + timestamp + "] " + mensaje + "")
 
     def ejecutar(self):
+        """Bucle principal automatico."""
         print()
-        print("[INICIO] Controles: ESPACIO=captura | C=clasificar | G=guardar | Q=salir")
+        print("[INICIO] Sistema corriendo en modo AUTOMATICO")
+        print("         Clasificacion activa | Capturas auto de sospechosos")
+        print("         Presiona 'q' para salir")
         print()
 
         while True:
             ret, frame = self.camara.leer_frame()
             if not ret:
                 print("[ERROR] Frame no leido. Reintentando...")
+                time.sleep(0.1)
                 continue
 
             self.contador_frames += 1
             h, w, _ = frame.shape
 
-            # DETECCION
+            # --- DETECCION + CLASIFICACION (siempre activa) ---
             frame_dibujado, boxes, total, keypoints_list = self.detector.detectar(frame.copy())
             clasificaciones = []
 
-            # CLASIFICACION
-            if self.modo_clasificacion and total > 0:
+            if total > 0:
                 clasificaciones = self.clasificador.clasificar(boxes, keypoints_list, h, w)
+                # Redibujar con colores de clasificacion
+                frame_dibujado, _, _, _ = self.detector.detectar(frame.copy(), clasificaciones)
 
-                for c in clasificaciones:
-                    x, y, bw, bh = c["box"]
-                    etiqueta = c["nombre"] + " (" + str(int(c["confianza"] * 100)) + "%)"
-                    colores = [(0, 255, 0), (0, 255, 255), (0, 0, 255)]
-                    color = colores[c["clase_idx"]]
-
-                    cv2.putText(frame_dibujado, etiqueta, (x, y - 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-            # ALERTAS
-            num_sospechosos = 0
+            # --- ALERTAS ---
             frame_dibujado, num_sospechosos = self.verificar_alertas(
                 frame_dibujado, boxes, total, clasificaciones
             )
 
-            # MENU
-            frame_final = self.mostrar_menu(frame_dibujado, total, num_sospechosos)
+            # --- HUD ---
+            frame_final = self.mostrar_hud(frame_dibujado, total, num_sospechosos, clasificaciones)
 
-            cv2.imshow("Sistema de Vigilancia Inteligente", frame_final)
+            cv2.imshow("Sistema de Vigilancia - AUTOMATICO", frame_final)
 
-            tecla = cv2.waitKey(1) & 0xFF
-
-            if tecla == ord("q"):
+            # --- UNICA TECLA: 'q' para salir ---
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 print()
                 print("[FIN] Cerrando sistema...")
                 break
-            elif tecla == ord(" "):
-                self.capturador.capturar_unica(frame, etiqueta="manual")
-                self.log_evento("Captura manual - " + str(total) + " personas")
-            elif tecla == ord("g"):
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                nombre = "frame_guardado_" + ts + ".jpg"
-                cv2.imwrite(nombre, frame)
-                print("[INFO] Frame guardado: " + nombre)
-            elif tecla == ord("c"):
-                self.modo_clasificacion = not self.modo_clasificacion
-                estado = "ACTIVADA" if self.modo_clasificacion else "DESACTIVADA"
-                print("[INFO] Clasificacion " + estado)
-                if not self.modo_clasificacion:
-                    self.clasificador.reset()
 
+            # --- LOG AUTOMATICO cada 5 segundos ---
             if time.time() - self.ultimo_log > 5:
                 if total > 0:
-                    self.log_evento("Estado: " + str(total) + " persona(s), " + str(num_sospechosos) + " sospechosas")
+                    self.log_evento("Estado: " + str(total) + " personas, " + str(num_sospechosos) + " sospechosas")
                 self.ultimo_log = time.time()
 
         self.camara.liberar()
-        print("[FIN] Sistema cerrado.")
+        print("[FIN] Sistema cerrado correctamente.")
         print("[INFO] Frames procesados: " + str(self.contador_frames))
-        print("[INFO] Log: log_vigilancia.txt")
+        print("[INFO] Log guardado en: log_vigilancia.txt")
+        if self.guardar_sospechosos:
+            print("[INFO] Capturas de sospechosos guardadas en: alertas_sospechosos/")
 
 
 if __name__ == "__main__":
     if not MODULOS_OK:
         exit(1)
-    sistema = SistemaVigilancia()
+
+    # Configuracion
+    GUARDAR_SOSPECHOSOS = True      # False = no guarda capturas
+    COOLDOWN_CAPTURA_SEG = 5        # Segundos entre capturas del mismo sospechoso
+
+    sistema = SistemaVigilancia(
+        guardar_sospechosos=GUARDAR_SOSPECHOSOS,
+        cooldown_captura_seg=COOLDOWN_CAPTURA_SEG
+    )
     sistema.ejecutar()

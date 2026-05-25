@@ -1,9 +1,9 @@
 """
 detector.py
 Responsabilidad: Detectar MULTIPLES personas usando YOLOv8 + MoveNet TF Lite.
-- YOLOv8-nano: Detecta cuántas personas hay en la escena (bounding boxes)
-- MoveNet: Extrae 17 keypoints de la persona PRINCIPAL (más grande/central)
-Devuelve: lista de boxes, lista de keypoints (uno por persona detectada)
+- YOLOv8-nano: Detecta cuántas personas hay en la escena
+- MoveNet: Extrae 17 keypoints de CADA persona detectada
+- Colorea bounding box según clasificación (verde/amarillo/rojo)
 """
 
 import os
@@ -14,10 +14,6 @@ import tensorflow as tf
 
 class DetectorPersonas:
     def __init__(self, ruta_movenet="modelos/movenet_lightning.tflite", umbral_confianza=0.3):
-        """
-        :param ruta_movenet: Ruta al archivo .tflite de MoveNet Lightning
-        :param umbral_confianza: Confianza minima para keypoints
-        """
         self.umbral_confianza = umbral_confianza
         self.interpreter = None
         self.input_details = None
@@ -41,21 +37,18 @@ class DetectorPersonas:
     def _cargar_yolo(self):
         try:
             from ultralytics import YOLO
-            # Descarga automatica de yolov8n.pt si no existe
             self.yolo = YOLO("yolov8n.pt")
             print("[Detector] YOLOv8-nano cargado (multi-persona).")
         except ImportError:
             print("[ADVERTENCIA] ultralytics no instalado. Instala con: pip install ultralytics")
-            print("[Detector] Solo se detectara 1 persona con MoveNet.")
             self.yolo = None
 
-    def detectar(self, frame):
+    def detectar(self, frame, clasificaciones=None):
         """
-        Detecta multiples personas.
+        Detecta multiples personas y dibuja resultados.
         :param frame: Imagen BGR de OpenCV
+        :param clasificaciones: Lista de dicts del clasificador (opcional, para colorear boxes)
         :return: (frame_dibujado, boxes, total_personas, lista_keypoints)
-                 boxes = [(x, y, w, h), ...]
-                 lista_keypoints = [array(17,3), ...] (puede tener None si no se detecta pose)
         """
         h, w, _ = frame.shape
         frame_dibujado = frame.copy()
@@ -64,7 +57,7 @@ class DetectorPersonas:
 
         # --- PASO 1: YOLOv8 detecta TODAS las personas ---
         if self.yolo is not None:
-            resultados_yolo = self.yolo(frame, verbose=False, classes=[0])  # clase 0 = persona
+            resultados_yolo = self.yolo(frame, verbose=False, classes=[0])
             for r in resultados_yolo:
                 for box in r.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -72,14 +65,11 @@ class DetectorPersonas:
                     if conf > 0.5:
                         boxes.append((x1, y1, x2 - x1, y2 - y1))
 
-        # Si YOLO no detecto nada, fallback a deteccion simple con MoveNet
         if len(boxes) == 0:
-            # Usar todo el frame como region de interes
             boxes = [(0, 0, w, h)]
 
         # --- PASO 2: MoveNet extrae keypoints de CADA persona ---
         for (x, y, bw, bh) in boxes:
-            # Recortar ROI de la persona
             x1 = max(0, x)
             y1 = max(0, y)
             x2 = min(w, x + bw)
@@ -90,53 +80,66 @@ class DetectorPersonas:
                 keypoints_list.append(None)
                 continue
 
-            # Preprocesar ROI para MoveNet
             roi_resized = cv2.resize(roi, (192, 192))
             input_img = np.expand_dims(roi_resized, axis=0).astype(np.float32)
 
-            # Inferencia MoveNet
             self.interpreter.set_tensor(self.input_details[0]["index"], input_img)
             self.interpreter.invoke()
             kps_raw = self.interpreter.get_tensor(self.output_details[0]["index"])
-            kps = np.squeeze(kps_raw)  # [17, 3]
+            kps = np.squeeze(kps_raw)
 
-            # Ajustar coordenadas keypoints al frame original
             rh, rw = roi.shape[:2]
             scale_x = rw / 192.0
             scale_y = rh / 192.0
 
             kps_ajustados = np.zeros_like(kps)
             for i in range(17):
-                kps_ajustados[i][0] = (kps[i][0] * 192.0 * scale_y + y1) / h  # y normalizado
-                kps_ajustados[i][1] = (kps[i][1] * 192.0 * scale_x + x1) / w  # x normalizado
-                kps_ajustados[i][2] = kps[i][2]  # confianza
+                kps_ajustados[i][0] = (kps[i][0] * 192.0 * scale_y + y1) / h
+                kps_ajustados[i][1] = (kps[i][1] * 192.0 * scale_x + x1) / w
+                kps_ajustados[i][2] = kps[i][2]
 
             keypoints_list.append(kps_ajustados)
 
-        # --- PASO 3: Dibujar resultados ---
+        # --- PASO 3: Dibujar resultados con COLORES según clasificación ---
         total = len(boxes)
-        for i, (x, y, bw, bh) in enumerate(boxes):
-            # Dibujar bounding box
-            color = (0, 255, 0)
-            if keypoints_list[i] is not None:
-                # Verificar si hay movimiento sospechoso (muñecas con alta confianza)
-                lw = keypoints_list[i][9]
-                rw = keypoints_list[i][10]
-                if (lw[2] > self.umbral_confianza or rw[2] > self.umbral_confianza):
-                    color = (0, 255, 0)  # verde por defecto
+        colores_clase = {
+            0: (0, 255, 0),     # Quieta -> VERDE
+            1: (0, 255, 255),   # Movimiento -> AMARILLO
+            2: (0, 0, 255)      # Sospechoso -> ROJO
+        }
 
-            cv2.rectangle(frame_dibujado, (x, y), (x + bw, y + bh), color, 2)
-            cv2.putText(frame_dibujado, "Persona " + str(i + 1), (x, y - 10),
+        for i, (x, y, bw, bh) in enumerate(boxes):
+            # Determinar color según clasificación si está disponible
+            color = (0, 255, 0)  # Default verde
+            etiqueta_clase = ""
+
+            if clasificaciones and i < len(clasificaciones):
+                c = clasificaciones[i]
+                color = colores_clase.get(c["clase_idx"], (0, 255, 0))
+                etiqueta_clase = " [" + c["nombre"] + "]"
+
+                # Si es sospechoso, dibujar alerta grande
+                if c["clase_idx"] == 2 and c["confianza"] > 0.6:
+                    cv2.putText(frame_dibujado, "!!! ALERTA SOSPECHOSO !!!", 
+                                (x, y - 50), cv2.FONT_HERSHEY_SIMPLEX, 
+                                0.8, (0, 0, 255), 3)
+
+            # Dibujar bounding box con color de clasificación
+            cv2.rectangle(frame_dibujado, (x, y), (x + bw, y + bh), color, 3)
+
+            # Etiqueta con número de persona y clase
+            texto = "Persona " + str(i + 1) + etiqueta_clase
+            cv2.putText(frame_dibujado, texto, (x, y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Dibujar keypoints si existen
+            # Dibujar keypoints y esqueleto
             if keypoints_list[i] is not None:
                 self._dibujar_keypoints(frame_dibujado, keypoints_list[i], h, w)
                 self._dibujar_esqueleto(frame_dibujado, keypoints_list[i], h, w)
 
-        # Mensaje general
+        # Mensaje general de conteo
         if total > 0:
-            cv2.putText(frame_dibujado, "Personas Detectadas: " + str(total), (10, 30),
+            cv2.putText(frame_dibujado, "Personas: " + str(total), (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
         return frame_dibujado, boxes, total, keypoints_list

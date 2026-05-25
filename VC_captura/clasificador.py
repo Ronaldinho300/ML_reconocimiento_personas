@@ -1,54 +1,64 @@
 """
 clasificador.py
-Responsabilidad: Clasificar comportamiento de MULTIPLES personas.
-Usa tracking por bounding box + velocidad de muñecas.
-Muestra alertas individuales por persona sospechosa.
+Clasifica comportamiento de múltiples personas:
+- Quieta
+- Movimiento normal  
+- Sospechoso (muñecas rápidas, acercamiento brusco o desplazamiento rápido)
 """
 
 import time
 import numpy as np
 
-
 class ClasificadorComportamiento:
-    def __init__(self, umbral_quieta=150.0, umbral_sospechoso=800.0, historial_frames=15):
+    def __init__(self,
+                 umbral_quieta=100.0,          # REDUCIDO: mas sensible a movimiento
+                 umbral_sospechoso=600.0,      # REDUCIDO: detecta sospechosos mas facil
+                 umbral_acercamiento=1.25,     # REDUCIDO: 25% de crecimiento en 1s
+                 umbral_desplazamiento=300.0,  # REDUCIDO: detecta desplazamiento rapido
+                 historial_frames=10):         # REDUCIDO: reacciona mas rapido
+
         self.umbral_quieta = umbral_quieta
         self.umbral_sospechoso = umbral_sospechoso
+        self.umbral_acercamiento = umbral_acercamiento
+        self.umbral_desplazamiento = umbral_desplazamiento
         self.historial_frames = historial_frames
-        self.historial = {}   # id_persona -> dict
+
+        self.historial = {}
         self.contador_id = 0
 
     def _asignar_ids(self, boxes):
-        """Asigna IDs persistentes basándose en proximidad del centroide del box."""
-        centroides_actuales = []
-        for (x, y, w, h) in boxes:
-            centroides_actuales.append((x + w / 2.0, y + h / 2.0))
+        """Asigna IDs persistentes usando proximidad de centroides."""
+        centroides = [(x + w/2, y + h/2) for (x, y, w, h) in boxes]
+        areas = [w * h for (_, _, w, h) in boxes]
 
         if not self.historial:
-            for i in range(len(centroides_actuales)):
+            for i in range(len(centroides)):
                 self.contador_id += 1
                 self.historial[self.contador_id] = {
-                    "centroide": centroides_actuales[i],
-                    "lw": None,
-                    "rw": None,
+                    "centroide": centroides[i],
+                    "area": areas[i],
+                    "lw": None, "rw": None,
                     "t": time.time(),
                     "velocidades": [],
+                    "areas": [areas[i]],
+                    "desplazamientos": [],
                     "clase_previa": "Quieta",
                     "sospechoso_count": 0
                 }
-            return list(range(1, len(centroides_actuales) + 1))
+            return list(range(1, len(centroides) + 1))
 
         ids_usados = set()
         asignaciones = []
         ids_disponibles = list(self.historial.keys())
 
-        for c_actual in centroides_actuales:
+        for c_act, a_act in zip(centroides, areas):
             mejor_id = None
             mejor_dist = float("inf")
             for pid in ids_disponibles:
                 if pid in ids_usados:
                     continue
-                c_previo = self.historial[pid]["centroide"]
-                dist = np.sqrt((c_actual[0] - c_previo[0])**2 + (c_actual[1] - c_previo[1])**2)
+                c_prev = self.historial[pid]["centroide"]
+                dist = np.hypot(c_act[0] - c_prev[0], c_act[1] - c_prev[1])
                 if dist < mejor_dist and dist < 150:
                     mejor_dist = dist
                     mejor_id = pid
@@ -56,15 +66,22 @@ class ClasificadorComportamiento:
             if mejor_id is not None:
                 asignaciones.append(mejor_id)
                 ids_usados.add(mejor_id)
-                self.historial[mejor_id]["centroide"] = c_actual
+                hist = self.historial[mejor_id]
+                hist["centroide"] = c_act
+                hist["area"] = a_act
+                hist["areas"].append(a_act)
+                if len(hist["areas"]) > self.historial_frames:
+                    hist["areas"].pop(0)
             else:
                 self.contador_id += 1
                 self.historial[self.contador_id] = {
-                    "centroide": c_actual,
-                    "lw": None,
-                    "rw": None,
+                    "centroide": c_act,
+                    "area": a_act,
+                    "lw": None, "rw": None,
                     "t": time.time(),
                     "velocidades": [],
+                    "areas": [a_act],
+                    "desplazamientos": [],
                     "clase_previa": "Quieta",
                     "sospechoso_count": 0
                 }
@@ -78,12 +95,6 @@ class ClasificadorComportamiento:
         return asignaciones
 
     def clasificar(self, boxes, keypoints_list, h, w):
-        """
-        :param boxes: Lista de (x, y, w, h)
-        :param keypoints_list: Lista de arrays (17,3) o None
-        :param h, w: Dimensiones del frame
-        :return: Lista de dicts con info completa por persona
-        """
         if not boxes:
             return []
 
@@ -96,66 +107,85 @@ class ClasificadorComportamiento:
             kps = keypoints_list[i] if i < len(keypoints_list) else None
             hist = self.historial[pid]
 
-            vel_max = 0.0
-            confianza = 0.5
+            vel_muneca_max = 0.0
+            vel_centroide = 0.0
+            factor_acercamiento = 1.0
             nombre = "Desconocido"
             clase_idx = 1
+            confianza = 0.5
 
+            # --- Velocidad de muñecas ---
             if kps is not None:
                 lw = kps[9]
                 rw = kps[10]
+                dt = t_actual - hist["t"]
+                if dt > 0:
+                    if lw[2] > 0.3 and hist["lw"] is not None:
+                        px_act = (lw[1] * w, lw[0] * h)
+                        px_prev = hist["lw"]
+                        dist = np.hypot(px_act[0] - px_prev[0], px_act[1] - px_prev[1])
+                        vel_muneca_max = max(vel_muneca_max, dist / dt)
+                    if rw[2] > 0.3 and hist["rw"] is not None:
+                        px_act = (rw[1] * w, rw[0] * h)
+                        px_prev = hist["rw"]
+                        dist = np.hypot(px_act[0] - px_prev[0], px_act[1] - px_prev[1])
+                        vel_muneca_max = max(vel_muneca_max, dist / dt)
 
-                # Calcular velocidad muñeca izquierda
-                if lw[2] > 0.3 and hist["lw"] is not None:
-                    dt = t_actual - hist["t"]
-                    if dt > 0:
-                        px_actual = (lw[1] * w, lw[0] * h)
-                        px_previo = hist["lw"]
-                        dist = np.sqrt((px_actual[0] - px_previo[0])**2 + (px_actual[1] - px_previo[1])**2)
-                        vel = dist / dt
-                        vel_max = max(vel_max, vel)
+                    if lw[2] > 0.3:
+                        hist["lw"] = (lw[1] * w, lw[0] * h)
+                    if rw[2] > 0.3:
+                        hist["rw"] = (rw[1] * w, rw[0] * h)
 
-                # Calcular velocidad muñeca derecha
-                if rw[2] > 0.3 and hist["rw"] is not None:
-                    dt = t_actual - hist["t"]
-                    if dt > 0:
-                        px_actual = (rw[1] * w, rw[0] * h)
-                        px_previo = hist["rw"]
-                        dist = np.sqrt((px_actual[0] - px_previo[0])**2 + (px_actual[1] - px_previo[1])**2)
-                        vel = dist / dt
-                        vel_max = max(vel_max, vel)
-
-                # Guardar velocidad
-                if vel_max > 0:
-                    hist["velocidades"].append(vel_max)
+                if vel_muneca_max > 0:
+                    hist["velocidades"].append(vel_muneca_max)
                     if len(hist["velocidades"]) > self.historial_frames:
                         hist["velocidades"].pop(0)
 
-                # Variabilidad
-                var = 0.0
-                if len(hist["velocidades"]) >= 5:
-                    var = np.std(hist["velocidades"])
+            # --- Velocidad de desplazamiento ---
+            if len(hist["centroide"]) > 0 and hist["t"] != t_actual:
+                dt = t_actual - hist["t"]
+                if dt > 0:
+                    cx_prev, cy_prev = hist["centroide"]
+                    cx_act, cy_act = (x + bw/2, y + bh/2)
+                    dist_centroide = np.hypot(cx_act - cx_prev, cy_act - cy_prev)
+                    vel_centroide = dist_centroide / dt
+                    hist["desplazamientos"].append(vel_centroide)
+                    if len(hist["desplazamientos"]) > self.historial_frames:
+                        hist["desplazamientos"].pop(0)
 
-                # Clasificación
-                if vel_max < self.umbral_quieta:
-                    clase_idx = 0
-                    nombre = "Quieta"
-                    confianza = min(0.99, 1.0 - (vel_max / self.umbral_quieta) * 0.3)
-                elif vel_max > self.umbral_sospechoso or var > 400.0:
-                    clase_idx = 2
-                    nombre = "Sospechoso"
-                    confianza = min(0.99, 0.7 + (vel_max / 2000.0) * 0.3)
-                    hist["sospechoso_count"] += 1
-                else:
-                    clase_idx = 1
-                    nombre = "Movimiento"
-                    confianza = min(0.95, 0.6 + (vel_max / self.umbral_sospechoso) * 0.3)
+            # --- Factor de acercamiento ---
+            if len(hist["areas"]) >= 2:
+                area_prev = hist["areas"][-2]
+                area_act = hist["areas"][-1]
+                if area_prev > 0:
+                    factor_acercamiento = area_act / area_prev
 
-                # Actualizar historial
-                if lw[2] > 0.3:
-                    hist["lw"] = (lw[1] * w, lw[0] * h)
-                if rw[2] > 0.3:
-                    hist["rw"] = (rw[1] * w, rw[0] * h)
+            dt_aprox = max(0.05, t_actual - hist["t"])
+            tasa_crecimiento = (factor_acercamiento - 1) / dt_aprox
+
+            # --- CLASIFICACION ---
+            es_acercamiento = (tasa_crecimiento > (self.umbral_acercamiento - 1))
+            es_muneca_rapida = (vel_muneca_max > self.umbral_sospechoso)
+            es_desplazamiento = (vel_centroide > self.umbral_desplazamiento)
+
+            # DEBUG: Mostrar valores en consola para ajuste
+            if vel_muneca_max > 50 or vel_centroide > 50:
+                print("[DEBUG] P" + str(pid) + " | muneca=" + str(int(vel_muneca_max)) + 
+                      " | despl=" + str(int(vel_centroide)) + " | acerc=" + str(round(factor_acercamiento, 2)))
+
+            if es_acercamiento or es_muneca_rapida or es_desplazamiento:
+                clase_idx = 2
+                nombre = "Sospechoso"
+                confianza = min(0.99, 0.7 + (vel_muneca_max / 1500.0) * 0.3)
+                hist["sospechoso_count"] += 1
+            elif vel_muneca_max < self.umbral_quieta and vel_centroide < self.umbral_quieta:
+                clase_idx = 0
+                nombre = "Quieta"
+                confianza = min(0.99, 1.0 - (vel_muneca_max / self.umbral_quieta) * 0.3)
+            else:
+                clase_idx = 1
+                nombre = "Movimiento"
+                confianza = min(0.95, 0.6 + (vel_muneca_max / self.umbral_sospechoso) * 0.3)
 
             hist["t"] = t_actual
             hist["clase_previa"] = nombre
@@ -165,7 +195,9 @@ class ClasificadorComportamiento:
                 "clase_idx": clase_idx,
                 "nombre": nombre,
                 "confianza": confianza,
-                "velocidad": vel_max,
+                "velocidad_munecas": vel_muneca_max,
+                "velocidad_desplazamiento": vel_centroide,
+                "factor_acercamiento": factor_acercamiento,
                 "box": (x, y, bw, bh),
                 "sospechoso_count": hist["sospechoso_count"]
             })
@@ -175,7 +207,3 @@ class ClasificadorComportamiento:
     def reset(self):
         self.historial.clear()
         self.contador_id = 0
-
-
-if __name__ == "__main__":
-    print("[Clasificador] Multi-persona listo.")
