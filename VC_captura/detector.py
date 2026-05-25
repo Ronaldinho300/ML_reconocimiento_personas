@@ -43,15 +43,15 @@ class DetectorPersonas:
             print("[ADVERTENCIA] ultralytics no instalado. Instala con: pip install ultralytics")
             self.yolo = None
 
-    def detectar(self, frame, clasificaciones=None):
+    def detectar(self, frame, clasificaciones=None, renderizar=True):
         """
-        Detecta multiples personas y dibuja resultados.
+        Detecta multiples personas.
         :param frame: Imagen BGR de OpenCV
         :param clasificaciones: Lista de dicts del clasificador (opcional, para colorear boxes)
-        :return: (frame_dibujado, boxes, total_personas, lista_keypoints)
+        :param renderizar: Si True, dibuja keypoints, boxes y esqueleto. Si False, retorna frame limpio.
+        :return: (frame_dibujado_o_limpio, boxes, total_personas, lista_keypoints)
         """
         h, w, _ = frame.shape
-        frame_dibujado = frame.copy()
         boxes = []
         keypoints_list = []
 
@@ -100,8 +100,24 @@ class DetectorPersonas:
 
             keypoints_list.append(kps_ajustados)
 
-        # --- PASO 3: Dibujar resultados con COLORES según clasificación ---
         total = len(boxes)
+
+        if not renderizar:
+            return frame, boxes, total, keypoints_list
+
+        # --- PASO 3: Dibujar ---
+        frame_dibujado = self.renderizar(frame, boxes, keypoints_list, clasificaciones)
+        return frame_dibujado, boxes, total, keypoints_list
+
+    def renderizar(self, frame, boxes, keypoints_list, clasificaciones=None):
+        """
+        Dibuja boxes, keypoints y esqueleto sobre una copia del frame.
+        Permite dibujar por separado sin re-ejecutar la detección.
+        """
+        frame_dibujado = frame.copy()
+        h, w = frame.shape[:2]
+        total = len(boxes)
+
         colores_clase = {
             0: (0, 255, 0),     # Quieta -> VERDE
             1: (0, 255, 255),   # Movimiento -> AMARILLO
@@ -109,7 +125,6 @@ class DetectorPersonas:
         }
 
         for i, (x, y, bw, bh) in enumerate(boxes):
-            # Determinar color según clasificación si está disponible
             color = (0, 255, 0)  # Default verde
             etiqueta_clase = ""
 
@@ -124,25 +139,25 @@ class DetectorPersonas:
                                 (x, y - 50), cv2.FONT_HERSHEY_SIMPLEX, 
                                 0.8, (0, 0, 255), 3)
 
-            # Dibujar bounding box con color de clasificación
+            # Bounding box con color de clasificación
             cv2.rectangle(frame_dibujado, (x, y), (x + bw, y + bh), color, 3)
 
-            # Etiqueta con número de persona y clase
+            # Etiqueta
             texto = "Persona " + str(i + 1) + etiqueta_clase
             cv2.putText(frame_dibujado, texto, (x, y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Dibujar keypoints y esqueleto
+            # Keypoints y esqueleto
             if keypoints_list[i] is not None:
                 self._dibujar_keypoints(frame_dibujado, keypoints_list[i], h, w)
                 self._dibujar_esqueleto(frame_dibujado, keypoints_list[i], h, w)
 
-        # Mensaje general de conteo
+        # Mensaje general
         if total > 0:
             cv2.putText(frame_dibujado, "Personas: " + str(total), (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-        return frame_dibujado, boxes, total, keypoints_list
+        return frame_dibujado
 
     def _dibujar_keypoints(self, frame, keypoints, h, w):
         for kp in keypoints:

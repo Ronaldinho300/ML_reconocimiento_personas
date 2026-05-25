@@ -4,6 +4,7 @@ Orquestador principal - VERSION COMPLETAMENTE AUTOMATICA.
 - No requiere pulsar teclas para clasificar ni capturar
 - Clasificacion activa siempre
 - Guardado automatico de sospechosos con cooldown por persona
+- La captura guardada es LIMPIA: solo un rectangulo rojo alrededor del sospechoso
 - Presiona 'q' para salir (unica tecla necesaria)
 """
 
@@ -146,8 +147,12 @@ class SistemaVigilancia:
 
         return frame
 
-    def verificar_alertas(self, frame, boxes, total_personas, clasificaciones):
-        """Verifica alertas y guarda capturas automaticas."""
+    def verificar_alertas(self, frame_dibujado, frame_original, boxes, total_personas, clasificaciones):
+        """
+        Verifica alertas y guarda capturas automaticas.
+        frame_dibujado: frame con todo dibujado (para mostrar en pantalla)
+        frame_original: frame limpio de la camara (para guardar capturas limpias)
+        """
         alertas = []
         color_borde = (0, 255, 0)
         ahora = time.time()
@@ -167,21 +172,34 @@ class SistemaVigilancia:
                     hay_sospechoso_ahora = True
                     pid = c["id"]
 
-                    # Dibujar alerta visual
+                    # Dibujar alerta visual SOLO en pantalla (frame_dibujado)
                     x, y, w, h = c["box"]
-                    cv2.line(frame, (x, y), (x + w, y + h), (0, 0, 255), 4)
-                    cv2.line(frame, (x + w, y), (x, y + h), (0, 0, 255), 4)
+                    cv2.line(frame_dibujado, (x, y), (x + w, y + h), (0, 0, 255), 4)
+                    cv2.line(frame_dibujado, (x + w, y), (x, y + h), (0, 0, 255), 4)
 
                     # Guardar captura automatica con cooldown
                     if self.guardar_sospechosos:
                         ultima = self.ultima_captura_sospechoso.get(pid, 0)
                         if ahora - ultima > self.cooldown_captura:
+                            # --- CAPTURA LIMPIA ---
+                            # Tomamos el frame original sin NINGUN dibujo
+                            # y le agregamos UNICAMENTE el rectangulo rojo del sospechoso
+                            frame_captura = frame_original.copy()
+                            bx, by, bw, bh = c["box"]
+
+                            # Solo el rectangulo rojo alrededor del sospechoso
+                            cv2.rectangle(frame_captura, (bx, by), (bx + bw, by + bh), (0, 0, 255), 3)
+                            cv2.putText(frame_captura, "SOSPECHOSO", (bx, by - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
                             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            nombre = "SOSPECHOSO_P" + str(pid) + "_" + ts + ".jpg"
-                            cv2.imwrite(nombre, frame)
+                            nombre_archivo = "SOSPECHOSO_P" + str(pid) + "_" + ts + ".jpg"
+                            ruta_completa = os.path.join(self.capturador.carpeta_salida, nombre_archivo)
+
+                            cv2.imwrite(ruta_completa, frame_captura)
                             self.ultima_captura_sospechoso[pid] = ahora
-                            self.log_evento("CAPTURA AUTO: Persona " + str(pid) + " -> " + nombre)
-                            print("[ALERTA] Captura guardada: " + nombre)
+                            self.log_evento("CAPTURA LIMPIA AUTO: Persona " + str(pid) + " -> " + nombre_archivo)
+                            print("[ALERTA] Captura limpia guardada: " + ruta_completa)
 
                     # Log
                     self.log_evento("SOSPECHOSO P" + str(pid) + " | munecas=" + 
@@ -209,7 +227,7 @@ class SistemaVigilancia:
                 if duracion > 10:
                     alertas.append("ALERTA: Presencia prolongada (" + str(int(duracion)) + "s)")
                     color_borde = (0, 165, 255)
-                    cv2.putText(frame, str(int(duracion)) + "s", (x, y + h + 20),
+                    cv2.putText(frame_dibujado, str(int(duracion)) + "s", (x, y + h + 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
 
         self.tracker_presencia = {k: v for k, v in self.tracker_presencia.items() if k in ids_activos}
@@ -217,23 +235,23 @@ class SistemaVigilancia:
         # Dibujar alertas en pantalla
         if alertas:
             for i, alerta in enumerate(alertas[-3:]):
-                cv2.putText(frame, alerta, (15, 460 - i * 25),
+                cv2.putText(frame_dibujado, alerta, (15, 460 - i * 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.rectangle(frame, (0, 0), (639, 479), color_borde, 4)
+            cv2.rectangle(frame_dibujado, (0, 0), (639, 479), color_borde, 4)
 
-        return frame, num_sospechosos
+        return frame_dibujado, num_sospechosos
 
     def log_evento(self, mensaje):
         """Registra eventos en archivo de log."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open("log_vigilancia.txt", "a", encoding="utf-8") as f:
-            f.write("[" + timestamp + "] " + mensaje + "")
+            f.write("[" + timestamp + "] " + mensaje + "\n")
 
     def ejecutar(self):
         """Bucle principal automatico."""
         print()
         print("[INICIO] Sistema corriendo en modo AUTOMATICO")
-        print("         Clasificacion activa | Capturas auto de sospechosos")
+        print("         Clasificacion activa | Capturas auto de sospechosos (imagen limpia)")
         print("         Presiona 'q' para salir")
         print()
 
@@ -247,18 +265,19 @@ class SistemaVigilancia:
             self.contador_frames += 1
             h, w, _ = frame.shape
 
-            # --- DETECCION + CLASIFICACION (siempre activa) ---
-            frame_dibujado, boxes, total, keypoints_list = self.detector.detectar(frame.copy())
-            clasificaciones = []
+            # --- DETECCION SIN DIBUJAR (conservamos frame limpio) ---
+            frame_limpio, boxes, total, keypoints_list = self.detector.detectar(frame, renderizar=False)
 
+            clasificaciones = []
             if total > 0:
                 clasificaciones = self.clasificador.clasificar(boxes, keypoints_list, h, w)
-                # Redibujar con colores de clasificacion
-                frame_dibujado, _, _, _ = self.detector.detectar(frame.copy(), clasificaciones)
 
-            # --- ALERTAS ---
+            # --- RENDERIZAR PARA PANTALLA (con todo: boxes, keypoints, esqueleto, colores) ---
+            frame_dibujado = self.detector.renderizar(frame, boxes, keypoints_list, clasificaciones)
+
+            # --- ALERTAS (recibe frame_dibujado para pantalla y frame original limpio para capturas) ---
             frame_dibujado, num_sospechosos = self.verificar_alertas(
-                frame_dibujado, boxes, total, clasificaciones
+                frame_dibujado, frame, boxes, total, clasificaciones
             )
 
             # --- HUD ---
@@ -283,7 +302,7 @@ class SistemaVigilancia:
         print("[INFO] Frames procesados: " + str(self.contador_frames))
         print("[INFO] Log guardado en: log_vigilancia.txt")
         if self.guardar_sospechosos:
-            print("[INFO] Capturas de sospechosos guardadas en: alertas_sospechosos/")
+            print("[INFO] Capturas limpias de sospechosos guardadas en: alertas_sospechosos/")
 
 
 if __name__ == "__main__":
@@ -291,6 +310,7 @@ if __name__ == "__main__":
         exit(1)
 
     # Configuracion
+    
     GUARDAR_SOSPECHOSOS = True      # False = no guarda capturas
     COOLDOWN_CAPTURA_SEG = 5        # Segundos entre capturas del mismo sospechoso
 
